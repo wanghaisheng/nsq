@@ -1,48 +1,42 @@
 #!/bin/bash
 set -e
-# a helper script to run tests in the appropriate directories
-
-for dir in nsqd nsqlookupd util/pqueue; do
-    echo "testing $dir"
-    pushd $dir >/dev/null
-    go test -test.v -timeout 15s
-    popd >/dev/null
-done
 
 # build and run nsqlookupd
-pushd nsqlookupd >/dev/null
-go build
-echo "starting nsqlookupd"
-./nsqlookupd >/dev/null 2>&1 &
+LOOKUP_LOGFILE=$(mktemp -t nsqlookupd.XXXXXXX)
+echo "building and starting nsqlookupd"
+echo "  logging to $LOOKUP_LOGFILE"
+go build -o apps/nsqlookupd/nsqlookupd ./apps/nsqlookupd/
+apps/nsqlookupd/nsqlookupd >$LOOKUP_LOGFILE 2>&1 &
 LOOKUPD_PID=$!
-popd >/dev/null
 
 # build and run nsqd configured to use our lookupd above
-pushd nsqd >/dev/null
-go build
-rm -f *.dat
-echo "starting nsqd --data-path=/tmp --lookupd-tcp-address=127.0.0.1:4160 --tls-cert=./test/cert.pem --tls-key=./test/key.pem"
-./nsqd --data-path=/tmp --lookupd-tcp-address=127.0.0.1:4160 --tls-cert=./test/cert.pem --tls-key=./test/key.pem >/dev/null 2>&1 &
+NSQD_LOGFILE=$(mktemp -t nsqd.XXXXXXX)
+cmd="apps/nsqd/nsqd --data-path=/tmp --lookupd-tcp-address=127.0.0.1:4160 --tls-cert=nsqd/test/certs/cert.pem --tls-key=nsqd/test/certs/key.pem"
+echo "building and starting $cmd"
+echo "  logging to $NSQD_LOGFILE"
+go build -o apps/nsqd/nsqd ./apps/nsqd
+$cmd >$NSQD_LOGFILE 2>&1 &
 NSQD_PID=$!
-popd >/dev/null
 
 sleep 0.3
 
 cleanup() {
-    kill -s TERM $NSQD_PID
-    kill -s TERM $LOOKUPD_PID
+    echo "killing nsqd PID $NSQD_PID"
+    kill -s TERM $NSQD_PID || cat $NSQD_LOGFILE
+    echo "killing nsqlookupd PID $LOOKUPD_PID"
+    kill -s TERM $LOOKUPD_PID || cat $LOOKUP_LOGFILE
 }
 trap cleanup INT TERM EXIT
 
-pushd nsq >/dev/null
-echo "testing nsq"
-go test -v -timeout 15s
-popd >/dev/null
+go test -timeout 60s ./...
+GOMAXPROCS=4 go test -timeout 60s -race ./...
 
 # no tests, but a build is something
-for dir in nsqadmin nsqlookupd examples/*; do
-    pushd $dir >/dev/null
-    echo "building $dir"
-    go build
-    popd >/dev/null
+for dir in nsqadmin apps/* bench/*; do
+    if grep -q '^package main$' $dir/*.go ; then
+        echo "building $dir"
+        go build -o $dir/$(basename $dir) ./$dir
+    else
+        echo "WARNING: skipping go build in $dir"
+    fi
 done

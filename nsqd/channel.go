@@ -1,18 +1,17 @@
-package main
+package nsqd
 
 import (
 	"bytes"
 	"container/heap"
 	"errors"
-	"github.com/bitly/nsq/nsq"
-	"github.com/bitly/nsq/util"
-	"github.com/bitly/nsq/util/pqueue"
-	"log"
 	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/bitly/nsq/util"
+	"github.com/bitly/nsq/util/pqueue"
 )
 
 // the amount of time a worker will wait when idle
@@ -34,100 +33,104 @@ type Consumer interface {
 // of subscribers (clients).
 //
 // Channels maintain all client and message metadata, orchestrating in-flight
-// messages, timeouts, requeueing, etc.
+// messages, timeouts, requeuing, etc.
 type Channel struct {
-	sync.RWMutex // embed a r/w mutex
+	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	requeueCount uint64
+	messageCount uint64
+	timeoutCount uint64
+
+	sync.RWMutex
 
 	topicName string
 	name      string
-	context   *Context
+	ctx       *context
 
 	backend BackendQueue
 
-	incomingMsgChan chan *nsq.Message
-	memoryMsgChan   chan *nsq.Message
-	clientMsgChan   chan *nsq.Message
-	exitChan        chan int
-	waitGroup       util.WaitGroupWrapper
-	exitFlag        int32
+	memoryMsgChan chan *Message
+	clientMsgChan chan *Message
+	exitChan      chan int
+	waitGroup     util.WaitGroupWrapper
+	exitFlag      int32
 
 	// state tracking
-	clients          map[int64]Consumer
-	paused           int32
-	ephemeralChannel bool
-	deleteCallback   func(*Channel)
-	deleter          sync.Once
+	clients        map[int64]Consumer
+	paused         int32
+	ephemeral      bool
+	deleteCallback func(*Channel)
+	deleter        sync.Once
+
+	// Stats tracking
+	e2eProcessingLatencyStream *util.Quantile
 
 	// TODO: these can be DRYd up
-	deferredMessages map[nsq.MessageID]*pqueue.Item
+	deferredMessages map[MessageID]*pqueue.Item
 	deferredPQ       pqueue.PriorityQueue
 	deferredMutex    sync.Mutex
-	inFlightMessages map[nsq.MessageID]*pqueue.Item
-	inFlightPQ       pqueue.PriorityQueue
+	inFlightMessages map[MessageID]*Message
+	inFlightPQ       inFlightPqueue
 	inFlightMutex    sync.Mutex
 
 	// stat counters
-	requeueCount  uint64
-	messageCount  uint64
-	timeoutCount  uint64
 	bufferedCount int32
 }
 
-type inFlightMessage struct {
-	msg      *nsq.Message
-	clientID int64
-	ts       time.Time
-}
-
 // NewChannel creates a new instance of the Channel type and returns a pointer
-func NewChannel(topicName string, channelName string, context *Context,
+func NewChannel(topicName string, channelName string, ctx *context,
 	deleteCallback func(*Channel)) *Channel {
+
 	c := &Channel{
-		topicName:       topicName,
-		name:            channelName,
-		incomingMsgChan: make(chan *nsq.Message, 1),
-		memoryMsgChan:   make(chan *nsq.Message, context.nsqd.options.memQueueSize),
-		clientMsgChan:   make(chan *nsq.Message),
-		exitChan:        make(chan int),
-		clients:         make(map[int64]Consumer),
-		deleteCallback:  deleteCallback,
-		context:         context,
+		topicName:      topicName,
+		name:           channelName,
+		memoryMsgChan:  make(chan *Message, ctx.nsqd.opts.MemQueueSize),
+		clientMsgChan:  make(chan *Message),
+		exitChan:       make(chan int),
+		clients:        make(map[int64]Consumer),
+		deleteCallback: deleteCallback,
+		ctx:            ctx,
+	}
+	if len(ctx.nsqd.opts.E2EProcessingLatencyPercentiles) > 0 {
+		c.e2eProcessingLatencyStream = util.NewQuantile(
+			ctx.nsqd.opts.E2EProcessingLatencyWindowTime,
+			ctx.nsqd.opts.E2EProcessingLatencyPercentiles,
+		)
 	}
 
 	c.initPQ()
 
 	if strings.HasSuffix(channelName, "#ephemeral") {
-		c.ephemeralChannel = true
-		c.backend = NewDummyBackendQueue()
+		c.ephemeral = true
+		c.backend = newDummyBackendQueue()
 	} else {
-		// backend names, for uniqueness, automatically include the topic... <topic>:<channel>
-		backendName := topicName + ":" + channelName
-		c.backend = NewDiskQueue(backendName,
-			context.nsqd.options.dataPath,
-			context.nsqd.options.maxBytesPerFile,
-			context.nsqd.options.syncEvery,
-			context.nsqd.options.syncTimeout)
+		// backend names, for uniqueness, automatically include the topic...
+		backendName := getBackendName(topicName, channelName)
+		c.backend = newDiskQueue(backendName,
+			ctx.nsqd.opts.DataPath,
+			ctx.nsqd.opts.MaxBytesPerFile,
+			ctx.nsqd.opts.SyncEvery,
+			ctx.nsqd.opts.SyncTimeout,
+			ctx.nsqd.opts.Logger)
 	}
 
 	go c.messagePump()
 
-	c.waitGroup.Wrap(func() { c.router() })
 	c.waitGroup.Wrap(func() { c.deferredWorker() })
 	c.waitGroup.Wrap(func() { c.inFlightWorker() })
 
-	go c.context.nsqd.Notify(c)
+	c.ctx.nsqd.Notify(c)
 
 	return c
 }
 
 func (c *Channel) initPQ() {
-	pqSize := int(math.Max(1, float64(c.context.nsqd.options.memQueueSize)/10))
+	pqSize := int(math.Max(1, float64(c.ctx.nsqd.opts.MemQueueSize)/10))
 
-	c.inFlightMessages = make(map[nsq.MessageID]*pqueue.Item)
-	c.deferredMessages = make(map[nsq.MessageID]*pqueue.Item)
+	c.inFlightMessages = make(map[MessageID]*Message)
+	c.deferredMessages = make(map[MessageID]*pqueue.Item)
 
 	c.inFlightMutex.Lock()
-	c.inFlightPQ = pqueue.New(pqSize)
+	c.inFlightPQ = newInFlightPqueue(pqSize)
 	c.inFlightMutex.Unlock()
 
 	c.deferredMutex.Lock()
@@ -156,26 +159,23 @@ func (c *Channel) exit(deleted bool) error {
 	}
 
 	if deleted {
-		log.Printf("CHANNEL(%s): deleting", c.name)
+		c.ctx.nsqd.logf("CHANNEL(%s): deleting", c.name)
 
 		// since we are explicitly deleting a channel (not just at system exit time)
 		// de-register this from the lookupd
-		go c.context.nsqd.Notify(c)
+		c.ctx.nsqd.Notify(c)
 	} else {
-		log.Printf("CHANNEL(%s): closing", c.name)
+		c.ctx.nsqd.logf("CHANNEL(%s): closing", c.name)
 	}
 
 	// this forceably closes client connections
+	c.RLock()
 	for _, client := range c.clients {
 		client.Close()
 	}
+	c.RUnlock()
 
 	close(c.exitChan)
-
-	// handle race condition w/ things writing into incomingMsgChan
-	c.Lock()
-	close(c.incomingMsgChan)
-	c.Unlock()
 
 	// synchronize the close of router() and pqWorkers (2)
 	c.waitGroup.Wait()
@@ -227,21 +227,21 @@ func (c *Channel) flush() error {
 	// messagePump is responsible for closing the channel it writes to
 	// this will read until its closed (exited)
 	for msg := range c.clientMsgChan {
-		log.Printf("CHANNEL(%s): recovered buffered message from clientMsgChan", c.name)
-		WriteMessageToBackend(&msgBuf, msg, c.backend)
+		c.ctx.nsqd.logf("CHANNEL(%s): recovered buffered message from clientMsgChan", c.name)
+		writeMessageToBackend(&msgBuf, msg, c.backend)
 	}
 
 	if len(c.memoryMsgChan) > 0 || len(c.inFlightMessages) > 0 || len(c.deferredMessages) > 0 {
-		log.Printf("CHANNEL(%s): flushing %d memory %d in-flight %d deferred messages to backend",
+		c.ctx.nsqd.logf("CHANNEL(%s): flushing %d memory %d in-flight %d deferred messages to backend",
 			c.name, len(c.memoryMsgChan), len(c.inFlightMessages), len(c.deferredMessages))
 	}
 
 	for {
 		select {
 		case msg := <-c.memoryMsgChan:
-			err := WriteMessageToBackend(&msgBuf, msg, c.backend)
+			err := writeMessageToBackend(&msgBuf, msg, c.backend)
 			if err != nil {
-				log.Printf("ERROR: failed to write message to backend - %s", err.Error())
+				c.ctx.nsqd.logf("ERROR: failed to write message to backend - %s", err)
 			}
 		default:
 			goto finish
@@ -249,19 +249,18 @@ func (c *Channel) flush() error {
 	}
 
 finish:
-	for _, item := range c.inFlightMessages {
-		msg := item.Value.(*inFlightMessage).msg
-		err := WriteMessageToBackend(&msgBuf, msg, c.backend)
+	for _, msg := range c.inFlightMessages {
+		err := writeMessageToBackend(&msgBuf, msg, c.backend)
 		if err != nil {
-			log.Printf("ERROR: failed to write message to backend - %s", err.Error())
+			c.ctx.nsqd.logf("ERROR: failed to write message to backend - %s", err)
 		}
 	}
 
 	for _, item := range c.deferredMessages {
-		msg := item.Value.(*nsq.Message)
-		err := WriteMessageToBackend(&msgBuf, msg, c.backend)
+		msg := item.Value.(*Message)
+		err := writeMessageToBackend(&msgBuf, msg, c.backend)
 		if err != nil {
-			log.Printf("ERROR: failed to write message to backend - %s", err.Error())
+			c.ctx.nsqd.logf("ERROR: failed to write message to backend - %s", err)
 		}
 	}
 
@@ -272,73 +271,108 @@ func (c *Channel) Depth() int64 {
 	return int64(len(c.memoryMsgChan)) + c.backend.Depth() + int64(atomic.LoadInt32(&c.bufferedCount))
 }
 
-func (c *Channel) Pause() {
-	atomic.StoreInt32(&c.paused, 1)
-	c.RLock()
-	defer c.RUnlock()
-	for _, client := range c.clients {
-		client.Pause()
-	}
+func (c *Channel) Pause() error {
+	return c.doPause(true)
 }
 
-func (c *Channel) UnPause() {
-	atomic.StoreInt32(&c.paused, 0)
-	c.RLock()
-	defer c.RUnlock()
-	for _, client := range c.clients {
-		client.UnPause()
+func (c *Channel) UnPause() error {
+	return c.doPause(false)
+}
+
+func (c *Channel) doPause(pause bool) error {
+	if pause {
+		atomic.StoreInt32(&c.paused, 1)
+	} else {
+		atomic.StoreInt32(&c.paused, 0)
 	}
+
+	c.RLock()
+	for _, client := range c.clients {
+		if pause {
+			client.Pause()
+		} else {
+			client.UnPause()
+		}
+	}
+	c.RUnlock()
+
+	c.ctx.nsqd.Lock()
+	defer c.ctx.nsqd.Unlock()
+	// pro-actively persist metadata so in case of process failure
+	// nsqd won't suddenly (un)pause a channel
+	return c.ctx.nsqd.PersistMetadata()
 }
 
 func (c *Channel) IsPaused() bool {
 	return atomic.LoadInt32(&c.paused) == 1
 }
 
-// PutMessage writes to the appropriate incoming message channel
-// (which will be routed asynchronously)
-func (c *Channel) PutMessage(msg *nsq.Message) error {
+// PutMessage writes a Message to the queue
+func (c *Channel) PutMessage(m *Message) error {
 	c.RLock()
 	defer c.RUnlock()
 	if atomic.LoadInt32(&c.exitFlag) == 1 {
 		return errors.New("exiting")
 	}
-	c.incomingMsgChan <- msg
+	err := c.put(m)
+	if err != nil {
+		return err
+	}
 	atomic.AddUint64(&c.messageCount, 1)
 	return nil
 }
 
+func (c *Channel) put(m *Message) error {
+	select {
+	case c.memoryMsgChan <- m:
+	default:
+		b := bufferPoolGet()
+		err := writeMessageToBackend(b, m, c.backend)
+		bufferPoolPut(b)
+		if err != nil {
+			c.ctx.nsqd.logf("CHANNEL(%s) ERROR: failed to write message to backend - %s",
+				c.name, err)
+			c.ctx.nsqd.SetHealth(err)
+			return err
+		}
+	}
+	return nil
+}
+
 // TouchMessage resets the timeout for an in-flight message
-func (c *Channel) TouchMessage(clientID int64, id nsq.MessageID) error {
-	item, err := c.popInFlightMessage(clientID, id)
+func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout time.Duration) error {
+	msg, err := c.popInFlightMessage(clientID, id)
 	if err != nil {
 		return err
 	}
-	c.removeFromInFlightPQ(item)
+	c.removeFromInFlightPQ(msg)
 
-	ifMsg := item.Value.(*inFlightMessage)
-	currentTimeout := time.Unix(0, item.Priority)
-	newTimeout := currentTimeout.Add(c.context.nsqd.options.msgTimeout)
-	if newTimeout.Add(c.context.nsqd.options.msgTimeout).Sub(ifMsg.ts) >= c.context.nsqd.options.maxMsgTimeout {
+	newTimeout := time.Now().Add(clientMsgTimeout)
+	if newTimeout.Sub(msg.deliveryTS) >=
+		c.ctx.nsqd.opts.MaxMsgTimeout {
 		// we would have gone over, set to the max
-		newTimeout = ifMsg.ts.Add(c.context.nsqd.options.maxMsgTimeout)
+		newTimeout = msg.deliveryTS.Add(c.ctx.nsqd.opts.MaxMsgTimeout)
 	}
 
-	item.Priority = newTimeout.UnixNano()
-	err = c.pushInFlightMessage(item)
+	msg.pri = newTimeout.UnixNano()
+	err = c.pushInFlightMessage(msg)
 	if err != nil {
 		return err
 	}
-	c.addToInFlightPQ(item)
+	c.addToInFlightPQ(msg)
 	return nil
 }
 
 // FinishMessage successfully discards an in-flight message
-func (c *Channel) FinishMessage(clientID int64, id nsq.MessageID) error {
-	item, err := c.popInFlightMessage(clientID, id)
+func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
+	msg, err := c.popInFlightMessage(clientID, id)
 	if err != nil {
 		return err
 	}
-	c.removeFromInFlightPQ(item)
+	c.removeFromInFlightPQ(msg)
+	if c.e2eProcessingLatencyStream != nil {
+		c.e2eProcessingLatencyStream.Insert(msg.Timestamp)
+	}
 	return nil
 }
 
@@ -348,15 +382,13 @@ func (c *Channel) FinishMessage(clientID int64, id nsq.MessageID) error {
 // `timeoutMs`  > 0 - asynchronously wait for the specified timeout
 //     and requeue a message (aka "deferred requeue")
 //
-func (c *Channel) RequeueMessage(clientID int64, id nsq.MessageID, timeout time.Duration) error {
+func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Duration) error {
 	// remove from inflight first
-	item, err := c.popInFlightMessage(clientID, id)
+	msg, err := c.popInFlightMessage(clientID, id)
 	if err != nil {
 		return err
 	}
-	c.removeFromInFlightPQ(item)
-
-	msg := item.Value.(*inFlightMessage).msg
+	c.removeFromInFlightPQ(msg)
 
 	if timeout == 0 {
 		return c.doRequeue(msg)
@@ -389,25 +421,25 @@ func (c *Channel) RemoveClient(clientID int64) {
 	}
 	delete(c.clients, clientID)
 
-	if len(c.clients) == 0 && c.ephemeralChannel == true {
+	if len(c.clients) == 0 && c.ephemeral == true {
 		go c.deleter.Do(func() { c.deleteCallback(c) })
 	}
 }
 
-func (c *Channel) StartInFlightTimeout(msg *nsq.Message, clientID int64) error {
+func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
 	now := time.Now()
-	value := &inFlightMessage{msg, clientID, now}
-	absTs := now.Add(c.context.nsqd.options.msgTimeout).UnixNano()
-	item := &pqueue.Item{Value: value, Priority: absTs}
-	err := c.pushInFlightMessage(item)
+	msg.clientID = clientID
+	msg.deliveryTS = now
+	msg.pri = now.Add(timeout).UnixNano()
+	err := c.pushInFlightMessage(msg)
 	if err != nil {
 		return err
 	}
-	c.addToInFlightPQ(item)
+	c.addToInFlightPQ(msg)
 	return nil
 }
 
-func (c *Channel) StartDeferredTimeout(msg *nsq.Message, timeout time.Duration) error {
+func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
 	absTs := time.Now().Add(timeout).UnixNano()
 	item := &pqueue.Item{Value: msg, Priority: absTs}
 	err := c.pushDeferredMessage(item)
@@ -419,68 +451,65 @@ func (c *Channel) StartDeferredTimeout(msg *nsq.Message, timeout time.Duration) 
 }
 
 // doRequeue performs the low level operations to requeue a message
-func (c *Channel) doRequeue(msg *nsq.Message) error {
+func (c *Channel) doRequeue(m *Message) error {
 	c.RLock()
 	defer c.RUnlock()
 	if atomic.LoadInt32(&c.exitFlag) == 1 {
 		return errors.New("exiting")
 	}
-	c.incomingMsgChan <- msg
+	err := c.put(m)
+	if err != nil {
+		return err
+	}
 	atomic.AddUint64(&c.requeueCount, 1)
 	return nil
 }
 
 // pushInFlightMessage atomically adds a message to the in-flight dictionary
-func (c *Channel) pushInFlightMessage(item *pqueue.Item) error {
+func (c *Channel) pushInFlightMessage(msg *Message) error {
 	c.Lock()
-	defer c.Unlock()
-
-	id := item.Value.(*inFlightMessage).msg.Id
-	_, ok := c.inFlightMessages[id]
+	_, ok := c.inFlightMessages[msg.ID]
 	if ok {
+		c.Unlock()
 		return errors.New("ID already in flight")
 	}
-	c.inFlightMessages[id] = item
-
+	c.inFlightMessages[msg.ID] = msg
+	c.Unlock()
 	return nil
 }
 
 // popInFlightMessage atomically removes a message from the in-flight dictionary
-func (c *Channel) popInFlightMessage(clientID int64, id nsq.MessageID) (*pqueue.Item, error) {
+func (c *Channel) popInFlightMessage(clientID int64, id MessageID) (*Message, error) {
 	c.Lock()
-	defer c.Unlock()
-
-	item, ok := c.inFlightMessages[id]
+	msg, ok := c.inFlightMessages[id]
 	if !ok {
+		c.Unlock()
 		return nil, errors.New("ID not in flight")
 	}
-
-	if item.Value.(*inFlightMessage).clientID != clientID {
+	if msg.clientID != clientID {
+		c.Unlock()
 		return nil, errors.New("client does not own message")
 	}
-
 	delete(c.inFlightMessages, id)
-
-	return item, nil
+	c.Unlock()
+	return msg, nil
 }
 
-func (c *Channel) addToInFlightPQ(item *pqueue.Item) {
+func (c *Channel) addToInFlightPQ(msg *Message) {
 	c.inFlightMutex.Lock()
-	defer c.inFlightMutex.Unlock()
-
-	heap.Push(&c.inFlightPQ, item)
+	c.inFlightPQ.Push(msg)
+	c.inFlightMutex.Unlock()
 }
 
-func (c *Channel) removeFromInFlightPQ(item *pqueue.Item) {
+func (c *Channel) removeFromInFlightPQ(msg *Message) {
 	c.inFlightMutex.Lock()
-	defer c.inFlightMutex.Unlock()
-
-	if item.Index == -1 {
-		// this item has already been Pop'd off the pqueue
+	if msg.index == -1 {
+		// this item has already been popped off the pqueue
+		c.inFlightMutex.Unlock()
 		return
 	}
-
-	heap.Remove(&c.inFlightPQ, item.Index)
+	c.inFlightPQ.Remove(msg.index)
+	c.inFlightMutex.Unlock()
 }
 
 func (c *Channel) pushDeferredMessage(item *pqueue.Item) error {
@@ -488,7 +517,7 @@ func (c *Channel) pushDeferredMessage(item *pqueue.Item) error {
 	defer c.Unlock()
 
 	// TODO: these map lookups are costly
-	id := item.Value.(*nsq.Message).Id
+	id := item.Value.(*Message).ID
 	_, ok := c.deferredMessages[id]
 	if ok {
 		return errors.New("ID already deferred")
@@ -498,7 +527,7 @@ func (c *Channel) pushDeferredMessage(item *pqueue.Item) error {
 	return nil
 }
 
-func (c *Channel) popDeferredMessage(id nsq.MessageID) (*pqueue.Item, error) {
+func (c *Channel) popDeferredMessage(id MessageID) (*pqueue.Item, error) {
 	c.Lock()
 	defer c.Unlock()
 
@@ -519,33 +548,13 @@ func (c *Channel) addToDeferredPQ(item *pqueue.Item) {
 	heap.Push(&c.deferredPQ, item)
 }
 
-// Router handles the muxing of incoming Channel messages, either writing
-// to the in-memory channel or to the backend
-func (c *Channel) router() {
-	var msgBuf bytes.Buffer
-	for msg := range c.incomingMsgChan {
-		select {
-		case c.memoryMsgChan <- msg:
-		default:
-			err := WriteMessageToBackend(&msgBuf, msg, c.backend)
-			if err != nil {
-				log.Printf("CHANNEL(%s) ERROR: failed to write message to backend - %s", c.name, err.Error())
-				// theres not really much we can do at this point, you're certainly
-				// going to lose messages...
-			}
-		}
-	}
-
-	log.Printf("CHANNEL(%s): closing ... router", c.name)
-}
-
 // messagePump reads messages from either memory or backend and writes
 // to the client output go channel
 //
 // it is also performs in-flight accounting and initiates the auto-requeue
 // goroutine
 func (c *Channel) messagePump() {
-	var msg *nsq.Message
+	var msg *Message
 	var buf []byte
 	var err error
 
@@ -560,9 +569,9 @@ func (c *Channel) messagePump() {
 		select {
 		case msg = <-c.memoryMsgChan:
 		case buf = <-c.backend.ReadChan():
-			msg, err = nsq.DecodeMessage(buf)
+			msg, err = decodeMessage(buf)
 			if err != nil {
-				log.Printf("ERROR: failed to decode message - %s", err.Error())
+				c.ctx.nsqd.logf("ERROR: failed to decode message - %s", err)
 				continue
 			}
 		case <-c.exitChan:
@@ -578,14 +587,14 @@ func (c *Channel) messagePump() {
 	}
 
 exit:
-	log.Printf("CHANNEL(%s): closing ... messagePump", c.name)
+	c.ctx.nsqd.logf("CHANNEL(%s): closing ... messagePump", c.name)
 	close(c.clientMsgChan)
 }
 
 func (c *Channel) deferredWorker() {
 	c.pqWorker(&c.deferredPQ, &c.deferredMutex, func(item *pqueue.Item) {
-		msg := item.Value.(*nsq.Message)
-		_, err := c.popDeferredMessage(msg.Id)
+		msg := item.Value.(*Message)
+		_, err := c.popDeferredMessage(msg.ID)
 		if err != nil {
 			return
 		}
@@ -594,20 +603,41 @@ func (c *Channel) deferredWorker() {
 }
 
 func (c *Channel) inFlightWorker() {
-	c.pqWorker(&c.inFlightPQ, &c.inFlightMutex, func(item *pqueue.Item) {
-		clientID := item.Value.(*inFlightMessage).clientID
-		msg := item.Value.(*inFlightMessage).msg
-		_, err := c.popInFlightMessage(clientID, msg.Id)
-		if err != nil {
-			return
+	ticker := time.NewTicker(defaultWorkerWait)
+	for {
+		select {
+		case <-ticker.C:
+		case <-c.exitChan:
+			goto exit
 		}
-		atomic.AddUint64(&c.timeoutCount, 1)
-		client, ok := c.clients[clientID]
-		if ok {
-			client.TimedOutMessage()
+		now := time.Now().UnixNano()
+		for {
+			c.inFlightMutex.Lock()
+			msg, _ := c.inFlightPQ.PeekAndShift(now)
+			c.inFlightMutex.Unlock()
+
+			if msg == nil {
+				break
+			}
+
+			_, err := c.popInFlightMessage(msg.clientID, msg.ID)
+			if err != nil {
+				break
+			}
+			atomic.AddUint64(&c.timeoutCount, 1)
+			c.RLock()
+			client, ok := c.clients[msg.clientID]
+			c.RUnlock()
+			if ok {
+				client.TimedOutMessage()
+			}
+			c.doRequeue(msg)
 		}
-		c.doRequeue(msg)
-	})
+	}
+
+exit:
+	c.ctx.nsqd.logf("CHANNEL(%s): closing ... inFlightWorker", c.name)
+	ticker.Stop()
 }
 
 // generic loop (executed in a goroutine) that periodically wakes up to walk
@@ -635,6 +665,6 @@ func (c *Channel) pqWorker(pq *pqueue.PriorityQueue, mutex *sync.Mutex, callback
 	}
 
 exit:
-	log.Printf("CHANNEL(%s): closing ... pqueue worker", c.name)
+	c.ctx.nsqd.logf("CHANNEL(%s): closing ... pqueue worker", c.name)
 	ticker.Stop()
 }

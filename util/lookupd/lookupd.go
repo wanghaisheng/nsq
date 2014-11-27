@@ -3,16 +3,31 @@ package lookupd
 import (
 	"errors"
 	"fmt"
-	"github.com/bitly/nsq/nsq"
-	"github.com/bitly/nsq/util"
-	"github.com/bitly/nsq/util/semver"
 	"log"
+	"net"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bitly/nsq/util"
+	"github.com/bitly/nsq/util/semver"
 )
+
+// GetVersion returns a semver.Version object by querying /info
+func GetVersion(addr string) (*semver.Version, error) {
+	endpoint := fmt.Sprintf("http://%s/info", addr)
+	log.Printf("version negotiation %s", endpoint)
+	info, err := util.APIRequestNegotiateV1("GET", endpoint, nil)
+	if err != nil {
+		log.Printf("ERROR: %s - %s", endpoint, err)
+		return nil, err
+	}
+	version := info.Get("version").MustString("unknown")
+	return semver.Parse(version)
+}
 
 // GetLookupdTopics returns a []string containing a union of all the topics
 // from all the given lookupd
@@ -25,9 +40,8 @@ func GetLookupdTopics(lookupdHTTPAddrs []string) ([]string, error) {
 		wg.Add(1)
 		endpoint := fmt.Sprintf("http://%s/topics", addr)
 		log.Printf("LOOKUPD: querying %s", endpoint)
-
 		go func(endpoint string) {
-			data, err := nsq.ApiRequest(endpoint)
+			data, err := util.APIRequestNegotiateV1("GET", endpoint, nil)
 			lock.Lock()
 			defer lock.Unlock()
 			defer wg.Done()
@@ -37,7 +51,7 @@ func GetLookupdTopics(lookupdHTTPAddrs []string) ([]string, error) {
 			}
 			success = true
 			// {"data":{"topics":["test"]}}
-			topics, _ := data.Get("topics").Array()
+			topics, _ := data.Get("topics").StringArray()
 			allTopics = util.StringUnion(allTopics, topics)
 		}(endpoint)
 	}
@@ -61,7 +75,7 @@ func GetLookupdTopicChannels(topic string, lookupdHTTPAddrs []string) ([]string,
 		endpoint := fmt.Sprintf("http://%s/channels?topic=%s", addr, url.QueryEscape(topic))
 		log.Printf("LOOKUPD: querying %s", endpoint)
 		go func(endpoint string) {
-			data, err := nsq.ApiRequest(endpoint)
+			data, err := util.APIRequestNegotiateV1("GET", endpoint, nil)
 			lock.Lock()
 			defer lock.Unlock()
 			defer wg.Done()
@@ -71,7 +85,7 @@ func GetLookupdTopicChannels(topic string, lookupdHTTPAddrs []string) ([]string,
 			}
 			success = true
 			// {"data":{"channels":["test"]}}
-			channels, _ := data.Get("channels").Array()
+			channels, _ := data.Get("channels").StringArray()
 			allChannels = util.StringUnion(allChannels, channels)
 		}(endpoint)
 	}
@@ -98,7 +112,7 @@ func GetLookupdProducers(lookupdHTTPAddrs []string) ([]*Producer, error) {
 		endpoint := fmt.Sprintf("http://%s/nodes", addr)
 		log.Printf("LOOKUPD: querying %s", endpoint)
 		go func(addr string, endpoint string) {
-			data, err := nsq.ApiRequest(endpoint)
+			data, err := util.APIRequestNegotiateV1("GET", endpoint, nil)
 			lock.Lock()
 			defer lock.Unlock()
 			defer wg.Done()
@@ -116,12 +130,8 @@ func GetLookupdProducers(lookupdHTTPAddrs []string) ([]*Producer, error) {
 				if remoteAddress == "" {
 					remoteAddress = "NA"
 				}
-				address := producer.Get("address").MustString() //TODO: remove for 1.0
 				hostname := producer.Get("hostname").MustString()
 				broadcastAddress := producer.Get("broadcast_address").MustString()
-				if broadcastAddress == "" {
-					broadcastAddress = address
-				}
 				httpPort := producer.Get("http_port").MustInt()
 				tcpPort := producer.Get("tcp_port").MustInt()
 				key := fmt.Sprintf("%s:%d:%d", broadcastAddress, httpPort, tcpPort)
@@ -160,7 +170,6 @@ func GetLookupdProducers(lookupdHTTPAddrs []string) ([]*Producer, error) {
 					}
 
 					p = &Producer{
-						Address:          address, //TODO: remove for 1.0
 						Hostname:         hostname,
 						BroadcastAddress: broadcastAddress,
 						TcpPort:          tcpPort,
@@ -204,7 +213,7 @@ func GetLookupdTopicProducers(topic string, lookupdHTTPAddrs []string) ([]string
 		log.Printf("LOOKUPD: querying %s", endpoint)
 
 		go func(endpoint string) {
-			data, err := nsq.ApiRequest(endpoint)
+			data, err := util.APIRequestNegotiateV1("GET", endpoint, nil)
 			lock.Lock()
 			defer lock.Unlock()
 			defer wg.Done()
@@ -217,13 +226,9 @@ func GetLookupdTopicProducers(topic string, lookupdHTTPAddrs []string) ([]string
 			producersArray, _ := producers.Array()
 			for i := range producersArray {
 				producer := producers.GetIndex(i)
-				address := producer.Get("address").MustString() //TODO: remove for 1.0
 				broadcastAddress := producer.Get("broadcast_address").MustString()
-				if broadcastAddress == "" {
-					broadcastAddress = address
-				}
 				httpPort := producer.Get("http_port").MustInt()
-				key := fmt.Sprintf("%s:%d", broadcastAddress, httpPort)
+				key := net.JoinHostPort(broadcastAddress, strconv.Itoa(httpPort))
 				allSources = util.StringAdd(allSources, key)
 			}
 		}(endpoint)
@@ -248,7 +253,7 @@ func GetNSQDTopics(nsqdHTTPAddrs []string) ([]string, error) {
 		log.Printf("NSQD: querying %s", endpoint)
 
 		go func(endpoint string) {
-			data, err := nsq.ApiRequest(endpoint)
+			data, err := util.APIRequestNegotiateV1("GET", endpoint, nil)
 			lock.Lock()
 			defer lock.Unlock()
 			defer wg.Done()
@@ -258,10 +263,9 @@ func GetNSQDTopics(nsqdHTTPAddrs []string) ([]string, error) {
 			}
 			success = true
 			topicList, _ := data.Get("topics").Array()
-			for _, topicInfo := range topicList {
-				topicInfo := topicInfo.(map[string]interface{})
-				topicName := topicInfo["topic_name"].(string)
-				topics = util.StringAdd(topics, topicName)
+			for i := range topicList {
+				topicInfo := data.Get("topics").GetIndex(i)
+				topics = util.StringAdd(topics, topicInfo.Get("topic_name").MustString())
 			}
 		}(endpoint)
 	}
@@ -285,8 +289,8 @@ func GetNSQDTopicProducers(topic string, nsqdHTTPAddrs []string) ([]string, erro
 		endpoint := fmt.Sprintf("http://%s/stats?format=json", addr)
 		log.Printf("NSQD: querying %s", endpoint)
 
-		go func(endpoint string) {
-			data, err := nsq.ApiRequest(endpoint)
+		go func(endpoint, addr string) {
+			data, err := util.APIRequestNegotiateV1("GET", endpoint, nil)
 			lock.Lock()
 			defer lock.Unlock()
 			defer wg.Done()
@@ -296,15 +300,14 @@ func GetNSQDTopicProducers(topic string, nsqdHTTPAddrs []string) ([]string, erro
 			}
 			success = true
 			topicList, _ := data.Get("topics").Array()
-			for _, topicInfo := range topicList {
-				topicInfo := topicInfo.(map[string]interface{})
-				topicName := topicInfo["topic_name"].(string)
-				if topicName == topic {
+			for i := range topicList {
+				topicInfo := data.Get("topics").GetIndex(i)
+				if topicInfo.Get("topic_name").MustString() == topic {
 					addresses = append(addresses, addr)
 					return
 				}
 			}
-		}(endpoint)
+		}(endpoint, addr)
 	}
 	wg.Wait()
 	if success == false {
@@ -318,125 +321,163 @@ func GetNSQDTopicProducers(topic string, nsqdHTTPAddrs []string) ([]string, erro
 // if selectedTopic is empty, this will return stats for *all* topic/channels
 // and the ChannelStats dict will be keyed by topic + ':' + channel
 func GetNSQDStats(nsqdHTTPAddrs []string, selectedTopic string) ([]*TopicStats, map[string]*ChannelStats, error) {
-	topicStats := make([]*TopicStats, 0)
-	channelStats := make(map[string]*ChannelStats)
-	success := false
 	var lock sync.Mutex
 	var wg sync.WaitGroup
+
+	topicStatsList := make(TopicStatsList, 0)
+	channelStatsMap := make(map[string]*ChannelStats)
+
+	success := false
 	for _, addr := range nsqdHTTPAddrs {
 		wg.Add(1)
 		endpoint := fmt.Sprintf("http://%s/stats?format=json", addr)
 		log.Printf("NSQD: querying %s", endpoint)
 
 		go func(endpoint string, addr string) {
-			data, err := nsq.ApiRequest(endpoint)
+			data, err := util.APIRequestNegotiateV1("GET", endpoint, nil)
 			lock.Lock()
 			defer lock.Unlock()
 			defer wg.Done()
+
 			if err != nil {
 				log.Printf("ERROR: lookupd %s - %s", endpoint, err.Error())
 				return
 			}
 			success = true
+
 			topics, _ := data.Get("topics").Array()
-			for _, topicInfo := range topics {
-				topicInfo := topicInfo.(map[string]interface{})
-				topicName := topicInfo["topic_name"].(string)
+			for i := range topics {
+				t := data.Get("topics").GetIndex(i)
+
+				topicName := t.Get("topic_name").MustString()
 				if selectedTopic != "" && topicName != selectedTopic {
 					continue
 				}
-				depth := int64(topicInfo["depth"].(float64))
-				backendDepth := int64(topicInfo["backend_depth"].(float64))
-				h := &TopicStats{
+				depth := t.Get("depth").MustInt64()
+				backendDepth := t.Get("backend_depth").MustInt64()
+				channels := t.Get("channels").MustArray()
+
+				e2eProcessingLatency := util.E2eProcessingLatencyAggregateFromJson(t.Get("e2e_processing_latency"), topicName, "", addr)
+
+				topicStats := &TopicStats{
 					HostAddress:  addr,
+					TopicName:    topicName,
 					Depth:        depth,
 					BackendDepth: backendDepth,
 					MemoryDepth:  depth - backendDepth,
-					MessageCount: int64(topicInfo["message_count"].(float64)),
-					ChannelCount: len(topicInfo["channels"].([]interface{})),
-					Topic:        topicName,
+					MessageCount: t.Get("message_count").MustInt64(),
+					ChannelCount: len(channels),
+					Paused:       t.Get("paused").MustBool(),
+
+					E2eProcessingLatency: e2eProcessingLatency,
 				}
-				topicStats = append(topicStats, h)
+				topicStatsList = append(topicStatsList, topicStats)
 
-				channels := topicInfo["channels"].([]interface{})
-				for _, c := range channels {
-					c := c.(map[string]interface{})
-					channelName := c["channel_name"].(string)
-					channelStatsKey := channelName
+				for j := range channels {
+					c := t.Get("channels").GetIndex(j)
+
+					channelName := c.Get("channel_name").MustString()
+					key := channelName
 					if selectedTopic == "" {
-						channelStatsKey = fmt.Sprintf("%s:%s", topicName, channelName)
+						key = fmt.Sprintf("%s:%s", topicName, channelName)
 					}
-					channel, ok := channelStats[channelStatsKey]
-					if !ok {
-						channel = &ChannelStats{
-							ChannelName: channelName,
-							Topic:       topicName,
-						}
-						channelStats[channelStatsKey] = channel
-					}
-					h := &ChannelStats{HostAddress: addr, ChannelName: channelName, Topic: topicName}
-					depth := int64(c["depth"].(float64))
-					backendDepth := int64(c["backend_depth"].(float64))
-					h.Depth = depth
-					var paused bool
-					pausedInterface, ok := c["paused"]
-					if ok {
-						paused = pausedInterface.(bool)
-					}
-					h.Paused = paused
-					h.BackendDepth = backendDepth
-					h.MemoryDepth = depth - backendDepth
-					h.InFlightCount = int64(c["in_flight_count"].(float64))
-					h.DeferredCount = int64(c["deferred_count"].(float64))
-					h.MessageCount = int64(c["message_count"].(float64))
-					h.RequeueCount = int64(c["requeue_count"].(float64))
-					h.TimeoutCount = int64(c["timeout_count"].(float64))
-					clients := c["clients"].([]interface{})
-					// TODO: this is sort of wrong; clients should be de-duped
-					// client A that connects to NSQD-a and NSQD-b should only be counted once. right?
-					h.ClientCount = len(clients)
-					channel.AddHostStats(h)
 
-					// "clients": [
-					//   {
-					//     "version": "V2",
-					//     "remote_address": "127.0.0.1:49700",
-					//     "name": "jehiah-air",
-					//     "state": 3,
-					//     "ready_count": 1000,
-					//     "in_flight_count": 0,
-					//     "message_count": 0,
-					//     "finish_count": 0,
-					//     "requeue_count": 0,
-					//     "connect_ts": 1347150965
-					//   }
-					// ]
-					for _, client := range clients {
-						client := client.(map[string]interface{})
-						connected := time.Unix(int64(client["connect_ts"].(float64)), 0)
-						connectedDuration := time.Now().Sub(connected).Seconds()
-						clientInfo := &ClientInfo{
-							HostAddress:       addr,
-							ClientVersion:     client["version"].(string),
-							ClientIdentifier:  fmt.Sprintf("%s:%s", client["name"].(string), strings.Split(client["remote_address"].(string), ":")[1]),
-							ConnectedDuration: time.Duration(int64(connectedDuration)) * time.Second, // truncate to second
-							InFlightCount:     int(client["in_flight_count"].(float64)),
-							ReadyCount:        int(client["ready_count"].(float64)),
-							FinishCount:       int64(client["finish_count"].(float64)),
-							RequeueCount:      int64(client["requeue_count"].(float64)),
-							MessageCount:      int64(client["message_count"].(float64)),
+					channelStats, ok := channelStatsMap[key]
+					if !ok {
+						channelStats = &ChannelStats{
+							HostAddress: addr,
+							TopicName:   topicName,
+							ChannelName: channelName,
 						}
-						channel.Clients = append(channel.Clients, clientInfo)
+						channelStatsMap[key] = channelStats
 					}
-					sort.Sort(ClientsByHost{channel.Clients})
+
+					depth := c.Get("depth").MustInt64()
+					backendDepth := c.Get("backend_depth").MustInt64()
+					clients := c.Get("clients").MustArray()
+
+					e2eProcessingLatency := util.E2eProcessingLatencyAggregateFromJson(c.Get("e2e_processing_latency"), topicName, channelName, addr)
+
+					hostChannelStats := &ChannelStats{
+						HostAddress:   addr,
+						TopicName:     topicName,
+						ChannelName:   channelName,
+						Depth:         depth,
+						BackendDepth:  backendDepth,
+						MemoryDepth:   depth - backendDepth,
+						Paused:        c.Get("paused").MustBool(),
+						InFlightCount: c.Get("in_flight_count").MustInt64(),
+						DeferredCount: c.Get("deferred_count").MustInt64(),
+						MessageCount:  c.Get("message_count").MustInt64(),
+						RequeueCount:  c.Get("requeue_count").MustInt64(),
+						TimeoutCount:  c.Get("timeout_count").MustInt64(),
+
+						E2eProcessingLatency: e2eProcessingLatency,
+						// TODO: this is sort of wrong; clients should be de-duped
+						// client A that connects to NSQD-a and NSQD-b should only be counted once. right?
+						ClientCount: len(clients),
+					}
+					channelStats.Add(hostChannelStats)
+
+					for k := range clients {
+						client := c.Get("clients").GetIndex(k)
+
+						connected := time.Unix(client.Get("connect_ts").MustInt64(), 0)
+						connectedDuration := time.Now().Sub(connected).Seconds()
+
+						clientId := client.Get("clientId").MustString()
+						if clientId == "" {
+							// TODO: deprecated, remove in 1.0
+							name := client.Get("name").MustString()
+							remoteAddressParts := strings.Split(client.Get("remote_address").MustString(), ":")
+							port := remoteAddressParts[len(remoteAddressParts)-1]
+							if len(remoteAddressParts) < 2 {
+								port = "NA"
+							}
+							clientId = fmt.Sprintf("%s:%s", name, port)
+						}
+
+						clientStats := &ClientStats{
+							HostAddress:       addr,
+							RemoteAddress:     client.Get("remote_address").MustString(),
+							Version:           client.Get("version").MustString(),
+							ClientID:          clientId,
+							Hostname:          client.Get("hostname").MustString(),
+							UserAgent:         client.Get("user_agent").MustString(),
+							ConnectedDuration: time.Duration(int64(connectedDuration)) * time.Second, // truncate to second
+							InFlightCount:     client.Get("in_flight_count").MustInt(),
+							ReadyCount:        client.Get("ready_count").MustInt(),
+							FinishCount:       client.Get("finish_count").MustInt64(),
+							RequeueCount:      client.Get("requeue_count").MustInt64(),
+							MessageCount:      client.Get("message_count").MustInt64(),
+							SampleRate:        int32(client.Get("sample_rate").MustInt()),
+							Deflate:           client.Get("deflate").MustBool(),
+							Snappy:            client.Get("snappy").MustBool(),
+							Authed:            client.Get("authed").MustBool(),
+							AuthIdentity:      client.Get("auth_identity").MustString(),
+							AuthIdentityUrl:   client.Get("auth_identity_url").MustString(),
+
+							TLS:                           client.Get("tls").MustBool(),
+							CipherSuite:                   client.Get("tls_cipher_suite").MustString(),
+							TLSVersion:                    client.Get("tls_version").MustString(),
+							TLSNegotiatedProtocol:         client.Get("tls_negotiated_protocol").MustString(),
+							TLSNegotiatedProtocolIsMutual: client.Get("tls_negotiated_protocol_is_mutual").MustBool(),
+						}
+						hostChannelStats.Clients = append(hostChannelStats.Clients, clientStats)
+						channelStats.Clients = append(channelStats.Clients, clientStats)
+					}
+					sort.Sort(ClientsByHost{hostChannelStats.Clients})
+					sort.Sort(ClientsByHost{channelStats.Clients})
+
+					topicStats.Channels = append(topicStats.Channels, hostChannelStats)
 				}
 			}
-			sort.Sort(TopicStatsByHost{topicStats})
+			sort.Sort(TopicStatsByHost{topicStatsList})
 		}(endpoint, addr)
 	}
 	wg.Wait()
 	if success == false {
 		return nil, nil, errors.New("unable to query any nsqd")
 	}
-	return topicStats, channelStats, nil
+	return topicStatsList, channelStatsMap, nil
 }

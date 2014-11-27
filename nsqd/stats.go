@@ -1,7 +1,9 @@
-package main
+package nsqd
 
 import (
 	"sort"
+
+	"github.com/bitly/nsq/util"
 )
 
 type TopicStats struct {
@@ -10,6 +12,9 @@ type TopicStats struct {
 	Depth        int64          `json:"depth"`
 	BackendDepth int64          `json:"backend_depth"`
 	MessageCount uint64         `json:"message_count"`
+	Paused       bool           `json:"paused"`
+
+	E2eProcessingLatency *util.PercentileResult `json:"e2e_processing_latency"`
 }
 
 func NewTopicStats(t *Topic, channels []ChannelStats) TopicStats {
@@ -19,6 +24,9 @@ func NewTopicStats(t *Topic, channels []ChannelStats) TopicStats {
 		Depth:        t.Depth(),
 		BackendDepth: t.backend.Depth(),
 		MessageCount: t.messageCount,
+		Paused:       t.IsPaused(),
+
+		E2eProcessingLatency: t.AggregateChannelE2eProcessingLatency().PercentileResult(),
 	}
 }
 
@@ -33,6 +41,8 @@ type ChannelStats struct {
 	TimeoutCount  uint64        `json:"timeout_count"`
 	Clients       []ClientStats `json:"clients"`
 	Paused        bool          `json:"paused"`
+
+	E2eProcessingLatency *util.PercentileResult `json:"e2e_processing_latency"`
 }
 
 func NewChannelStats(c *Channel, clients []ClientStats) ChannelStats {
@@ -47,20 +57,39 @@ func NewChannelStats(c *Channel, clients []ClientStats) ChannelStats {
 		TimeoutCount:  c.timeoutCount,
 		Clients:       clients,
 		Paused:        c.IsPaused(),
+
+		E2eProcessingLatency: c.e2eProcessingLatencyStream.PercentileResult(),
 	}
 }
 
 type ClientStats struct {
-	Version       string `json:"version"`
-	RemoteAddress string `json:"remote_address"`
-	Name          string `json:"name"`
-	State         int32  `json:"state"`
-	ReadyCount    int64  `json:"ready_count"`
-	InFlightCount int64  `json:"in_flight_count"`
-	MessageCount  uint64 `json:"message_count"`
-	FinishCount   uint64 `json:"finish_count"`
-	RequeueCount  uint64 `json:"requeue_count"`
-	ConnectTime   int64  `json:"connect_ts"`
+	// TODO: deprecated, remove in 1.0
+	Name string `json:"name"`
+
+	ClientID        string `json:"client_id"`
+	Hostname        string `json:"hostname"`
+	Version         string `json:"version"`
+	RemoteAddress   string `json:"remote_address"`
+	State           int32  `json:"state"`
+	ReadyCount      int64  `json:"ready_count"`
+	InFlightCount   int64  `json:"in_flight_count"`
+	MessageCount    uint64 `json:"message_count"`
+	FinishCount     uint64 `json:"finish_count"`
+	RequeueCount    uint64 `json:"requeue_count"`
+	ConnectTime     int64  `json:"connect_ts"`
+	SampleRate      int32  `json:"sample_rate"`
+	Deflate         bool   `json:"deflate"`
+	Snappy          bool   `json:"snappy"`
+	UserAgent       string `json:"user_agent"`
+	Authed          bool   `json:"authed,omitempty"`
+	AuthIdentity    string `json:"auth_identity,omitempty"`
+	AuthIdentityURL string `json:"auth_identity_url,omitempty"`
+
+	TLS                           bool   `json:"tls"`
+	CipherSuite                   string `json:"tls_cipher_suite"`
+	TLSVersion                    string `json:"tls_version"`
+	TLSNegotiatedProtocol         string `json:"tls_negotiated_protocol"`
+	TLSNegotiatedProtocolIsMutual bool   `json:"tls_negotiated_protocol_is_mutual"`
 }
 
 type Topics []*Topic
@@ -85,7 +114,7 @@ type ChannelsByName struct {
 
 func (c ChannelsByName) Less(i, j int) bool { return c.Channels[i].name < c.Channels[j].name }
 
-func (n *NSQd) getStats() []TopicStats {
+func (n *NSQD) GetStats() []TopicStats {
 	n.RLock()
 	defer n.RUnlock()
 

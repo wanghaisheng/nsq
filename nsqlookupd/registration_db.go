@@ -1,8 +1,9 @@
-package main
+package nsqlookupd
 
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,15 +20,14 @@ type Registration struct {
 type Registrations []Registration
 
 type PeerInfo struct {
+	lastUpdate       int64
 	id               string
 	RemoteAddress    string `json:"remote_address"`
-	Address          string `json:"address"` //TODO: drop for 1.0
 	Hostname         string `json:"hostname"`
 	BroadcastAddress string `json:"broadcast_address"`
 	TcpPort          int    `json:"tcp_port"`
 	HttpPort         int    `json:"http_port"`
 	Version          string `json:"version"`
-	lastUpdate       time.Time
 }
 
 type Producer struct {
@@ -207,7 +207,8 @@ func (pp Producers) FilterByActive(inactivityTimeout time.Duration, tombstoneLif
 	now := time.Now()
 	results := make(Producers, 0)
 	for _, p := range pp {
-		if now.Sub(p.peerInfo.lastUpdate) > inactivityTimeout || p.IsTombstoned(tombstoneLifetime) {
+		cur := time.Unix(0, atomic.LoadInt64(&p.peerInfo.lastUpdate))
+		if now.Sub(cur) > inactivityTimeout || p.IsTombstoned(tombstoneLifetime) {
 			continue
 		}
 		results = append(results, p)

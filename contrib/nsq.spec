@@ -1,5 +1,5 @@
 %define name nsq
-%define version 0.2.19
+%define version 0.3.0
 %define release 1
 %define path usr/local
 %define group Database/Applications
@@ -10,7 +10,7 @@ Name:       %{name}
 Version:    %{version}
 Release:    %{release}
 Group:      %{group}
-Packager:   Matt Reiferson <mattr@bit.ly>
+Packager:   Matt Reiferson <mreiferson@gmail.com>
 License:    Apache
 BuildRoot:  %{_tmppath}/%{name}-%{version}-%{release}
 AutoReqProv: no
@@ -18,7 +18,7 @@ AutoReqProv: no
 # BuildRequires: go
 
 %description 
-nsq - realtime distributed message processing at scale
+NSQ - A realtime distributed messaging platform
 https://github.com/bitly/nsq
 
 %prep
@@ -34,14 +34,16 @@ make PREFIX=/%{path}
 export DONT_STRIP=1
 rm -rf $RPM_BUILD_ROOT
 cd $RPM_BUILD_DIR/%{name}-%{version}-%{release}/nsq
-# binaries and template data
 make PREFIX=/${path} DESTDIR=$RPM_BUILD_ROOT install
 
 %files
 /%{path}/bin/nsqadmin
 /%{path}/bin/nsqd
 /%{path}/bin/nsqlookupd
-/%{path}/bin/nsq_to_file
 /%{path}/bin/nsq_pubsub
+/%{path}/bin/nsq_to_file
 /%{path}/bin/nsq_to_http
-/%{path}/share/nsqadmin/templates
+/%{path}/bin/nsq_to_nsq
+/%{path}/bin/nsq_tail
+/%{path}/bin/nsq_stat
+/%{path}/bin/to_nsq

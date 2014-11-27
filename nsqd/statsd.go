@@ -1,13 +1,13 @@
-package main
+package nsqd
 
 import (
 	"fmt"
-	"github.com/bitly/nsq/util"
-	"log"
 	"math"
 	"runtime"
 	"sort"
 	"time"
+
+	"github.com/bitly/nsq/util"
 )
 
 type Uint64Slice []uint64
@@ -24,25 +24,25 @@ func (s Uint64Slice) Less(i, j int) bool {
 	return s[i] < s[j]
 }
 
-func (n *NSQd) statsdLoop() {
+func (n *NSQD) statsdLoop() {
 	var lastMemStats runtime.MemStats
 	lastStats := make([]TopicStats, 0)
-	ticker := time.NewTicker(n.options.statsdInterval)
+	ticker := time.NewTicker(n.opts.StatsdInterval)
 	for {
 		select {
 		case <-n.exitChan:
 			goto exit
 		case <-ticker.C:
-			statsd := util.NewStatsdClient(n.options.statsdAddress, n.options.statsdPrefix)
+			statsd := util.NewStatsdClient(n.opts.StatsdAddress, n.opts.StatsdPrefix)
 			err := statsd.CreateSocket()
 			if err != nil {
-				log.Printf("ERROR: failed to create UDP socket to statsd(%s)", statsd)
+				n.logf("ERROR: failed to create UDP socket to statsd(%s)", statsd)
 				continue
 			}
 
-			log.Printf("STATSD: pushing stats to %s", statsd)
+			n.logf("STATSD: pushing stats to %s", statsd)
 
-			stats := n.getStats()
+			stats := n.GetStats()
 			for _, topic := range stats {
 				// try to find the topic in the last collection
 				lastTopic := TopicStats{}
@@ -61,6 +61,14 @@ func (n *NSQd) statsdLoop() {
 
 				stat = fmt.Sprintf("topic.%s.backend_depth", topic.TopicName)
 				statsd.Gauge(stat, topic.BackendDepth)
+
+				for _, item := range topic.E2eProcessingLatency.Percentiles {
+					stat = fmt.Sprintf("topic.%s.e2e_processing_latency_%.0f", topic.TopicName, item["quantile"]*100.0)
+					// We can cast the value to int64 since a value of 1 is the
+					// minimum resolution we will have, so there is no loss of
+					// accuracy
+					statsd.Gauge(stat, int64(item["value"]))
+				}
 
 				for _, channel := range topic.Channels {
 					// try to find the channel in the last collection
@@ -97,21 +105,26 @@ func (n *NSQd) statsdLoop() {
 
 					stat = fmt.Sprintf("topic.%s.channel.%s.clients", topic.TopicName, channel.ChannelName)
 					statsd.Gauge(stat, int64(len(channel.Clients)))
+
+					for _, item := range channel.E2eProcessingLatency.Percentiles {
+						stat = fmt.Sprintf("topic.%s.channel.%s.e2e_processing_latency_%.0f", topic.TopicName, channel.ChannelName, item["quantile"]*100.0)
+						statsd.Gauge(stat, int64(item["value"]))
+					}
 				}
 			}
 			lastStats = stats
 
-			if *statsdMemStats {
+			if n.opts.StatsdMemStats {
 				var memStats runtime.MemStats
 				runtime.ReadMemStats(&memStats)
 
 				// sort the GC pause array
-				length := 256
-				if len(memStats.PauseNs) <= 256 {
+				length := len(memStats.PauseNs)
+				if int(memStats.NumGC) < length {
 					length = int(memStats.NumGC)
 				}
 				gcPauses := make(Uint64Slice, length)
-				copy(gcPauses, memStats.PauseNs[:])
+				copy(gcPauses, memStats.PauseNs[:length])
 				sort.Sort(gcPauses)
 
 				statsd.Gauge("mem.heap_objects", int64(memStats.HeapObjects))
@@ -136,7 +149,10 @@ exit:
 }
 
 func percentile(perc float64, arr []uint64, length int) uint64 {
-	indexOfPerc := int(math.Ceil(((perc / 100.0) * float64(length)) + 0.5))
+	if length == 0 {
+		return 0
+	}
+	indexOfPerc := int(math.Floor(((perc / 100.0) * float64(length)) + 0.5))
 	if indexOfPerc >= length {
 		indexOfPerc = length - 1
 	}

@@ -1,35 +1,35 @@
-package main
+package nsqd
 
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/bitly/nsq/nsq"
-	"github.com/bitly/nsq/util"
-	"log"
 	"net"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/bitly/go-nsq"
+	"github.com/bitly/nsq/util"
 )
 
-func (n *NSQd) lookupLoop() {
-	syncTopicChan := make(chan *nsq.LookupPeer)
+func (n *NSQD) lookupLoop() {
+	syncTopicChan := make(chan *lookupPeer)
 
 	hostname, err := os.Hostname()
 	if err != nil {
-		log.Fatalf("ERROR: failed to get hostname - %s", err.Error())
+		n.logf("FATAL: failed to get hostname - %s", err)
+		os.Exit(1)
 	}
 
-	for _, host := range n.lookupdTCPAddrs {
-		log.Printf("LOOKUP: adding peer %s", host)
-		lookupPeer := nsq.NewLookupPeer(host, func(lp *nsq.LookupPeer) {
+	for _, host := range n.opts.NSQLookupdTCPAddresses {
+		n.logf("LOOKUP: adding peer %s", host)
+		lookupPeer := newLookupPeer(host, n.opts.Logger, func(lp *lookupPeer) {
 			ci := make(map[string]interface{})
 			ci["version"] = util.BINARY_VERSION
 			ci["tcp_port"] = n.tcpAddr.Port
 			ci["http_port"] = n.httpAddr.Port
-			ci["address"] = hostname //TODO: drop for 1.0
 			ci["hostname"] = hostname
-			ci["broadcast_address"] = n.options.broadcastAddress
+			ci["broadcast_address"] = n.opts.BroadcastAddress
 
 			cmd, err := nsq.Identify(ci)
 			if err != nil {
@@ -38,15 +38,15 @@ func (n *NSQd) lookupLoop() {
 			}
 			resp, err := lp.Command(cmd)
 			if err != nil {
-				log.Printf("LOOKUPD(%s): ERROR %s - %s", lp, cmd, err.Error())
+				n.logf("LOOKUPD(%s): ERROR %s - %s", lp, cmd, err)
 			} else if bytes.Equal(resp, []byte("E_INVALID")) {
-				log.Printf("LOOKUPD(%s): lookupd returned %s", lp, resp)
+				n.logf("LOOKUPD(%s): lookupd returned %s", lp, resp)
 			} else {
 				err = json.Unmarshal(resp, &lp.Info)
 				if err != nil {
-					log.Printf("LOOKUPD(%s): ERROR parsing response - %v", lp, resp)
+					n.logf("LOOKUPD(%s): ERROR parsing response - %v", lp, resp)
 				} else {
-					log.Printf("LOOKUPD(%s): peer info %+v", lp, lp.Info)
+					n.logf("LOOKUPD(%s): peer info %+v", lp, lp.Info)
 				}
 			}
 
@@ -65,11 +65,11 @@ func (n *NSQd) lookupLoop() {
 		case <-ticker:
 			// send a heartbeat and read a response (read detects closed conns)
 			for _, lookupPeer := range n.lookupPeers {
-				log.Printf("LOOKUPD(%s): sending heartbeat", lookupPeer)
+				n.logf("LOOKUPD(%s): sending heartbeat", lookupPeer)
 				cmd := nsq.Ping()
 				_, err := lookupPeer.Command(cmd)
 				if err != nil {
-					log.Printf("LOOKUPD(%s): ERROR %s - %s", lookupPeer, cmd, err.Error())
+					n.logf("LOOKUPD(%s): ERROR %s - %s", lookupPeer, cmd, err)
 				}
 			}
 		case val := <-n.notifyChan:
@@ -98,10 +98,10 @@ func (n *NSQd) lookupLoop() {
 			}
 
 			for _, lookupPeer := range n.lookupPeers {
-				log.Printf("LOOKUPD(%s): %s %s", lookupPeer, branch, cmd)
+				n.logf("LOOKUPD(%s): %s %s", lookupPeer, branch, cmd)
 				_, err := lookupPeer.Command(cmd)
 				if err != nil {
-					log.Printf("LOOKUPD(%s): ERROR %s - %s", lookupPeer, cmd, err.Error())
+					n.logf("LOOKUPD(%s): ERROR %s - %s", lookupPeer, cmd, err)
 				}
 			}
 		case lookupPeer := <-syncTopicChan:
@@ -122,10 +122,10 @@ func (n *NSQd) lookupLoop() {
 			n.RUnlock()
 
 			for _, cmd := range commands {
-				log.Printf("LOOKUPD(%s): %s", lookupPeer, cmd)
+				n.logf("LOOKUPD(%s): %s", lookupPeer, cmd)
 				_, err := lookupPeer.Command(cmd)
 				if err != nil {
-					log.Printf("LOOKUPD(%s): ERROR %s - %s", lookupPeer, cmd, err.Error())
+					n.logf("LOOKUPD(%s): ERROR %s - %s", lookupPeer, cmd, err)
 					break
 				}
 			}
@@ -135,18 +135,12 @@ func (n *NSQd) lookupLoop() {
 	}
 
 exit:
-	log.Printf("LOOKUP: closing")
+	n.logf("LOOKUP: closing")
 }
 
-func (n *NSQd) lookupHttpAddrs() []string {
+func (n *NSQD) lookupHttpAddrs() []string {
 	var lookupHttpAddrs []string
 	for _, lp := range n.lookupPeers {
-
-		//TODO: remove for 1.0
-		if len(lp.Info.BroadcastAddress) <= 0 {
-			lp.Info.BroadcastAddress = lp.Info.Address
-		}
-
 		if len(lp.Info.BroadcastAddress) <= 0 {
 			continue
 		}
